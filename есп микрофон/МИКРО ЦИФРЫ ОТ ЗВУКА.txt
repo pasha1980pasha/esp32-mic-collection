@@ -1,0 +1,61 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define MIC_PIN 4
+
+WebServer server(80);
+const char* ssid = "ESP32-Voice";
+const char* password = "12345678";
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body { background:#0a0f1e; color:white; font-family:Arial; text-align:center; padding:50px; }
+.value { font-size:10rem; color:#00ff88; margin:50px; }
+</style>
+</head>
+<body>
+<h1>🎤 ЗНАЧЕНИЕ МИКРОФОНА</h1>
+<div class="value" id="value">0</div>
+<script>
+function update() {
+  fetch('/data').then(r=>r.json()).then(d=> {
+    document.getElementById('value').innerHTML = d.value;
+  });
+}
+setInterval(update, 50);
+update();
+</script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  int val = analogRead(MIC_PIN);
+  String json = "{\"value\":" + String(val) + "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  analogReadResolution(12);
+  adcAttachPin(MIC_PIN);
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}

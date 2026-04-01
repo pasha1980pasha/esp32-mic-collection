@@ -1,0 +1,269 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= WIFI =================
+const char* ssid = "ESP32-Mic-Test";
+const char* password = "12345678";
+WebServer server(80);
+
+// ================= НАСТРОЙКИ HW-484 (АНАЛОГОВЫЙ) =================
+#define MIC_PIN 14  // GPIO14 (ADC1_CH6)
+#define SAMPLE_WINDOW 50  // мс для измерения
+#define SAMPLES 256       // количество семплов
+
+// Переменные
+int mic_value = 0;
+int mic_max = 0;
+int mic_min = 4095;
+float mic_volume = 0;
+bool mic_enabled = true;
+
+// ================= ИНИЦИАЛИЗАЦИЯ АЦП =================
+void init_adc_mic() {
+  Serial.println("Инициализация АЦП для HW-484...");
+  
+  // Настройка АЦП
+  analogReadResolution(12);  // 12 бит (0-4095)
+  analogSetAttenuation(ADC_11db);  // Диапазон ~0-3.3V
+  
+  // Калибровка (измерение шума)
+  long sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += analogRead(MIC_PIN);
+    delay(1);
+  }
+  int noise_level = sum / 100;
+  
+  Serial.printf("Уровень шума: %d\n", noise_level);
+  Serial.println("✅ HW-484 (аналоговый) готов");
+}
+
+// ================= ЧТЕНИЕ МИКРОФОНА =================
+void read_analog_mic() {
+  if (!mic_enabled) return;
+  
+  unsigned long start = millis();
+  int signal_max = 0;
+  int signal_min = 4095;
+  int sample_count = 0;
+  
+  // Сбор семплов в течение SAMPLE_WINDOW мс
+  while (millis() - start < SAMPLE_WINDOW) {
+    int sample = analogRead(MIC_PIN);
+    
+    if (sample > signal_max) signal_max = sample;
+    if (sample < signal_min) signal_min = sample;
+    
+    sample_count++;
+  }
+  
+  // Расчет peak-to-peak амплитуды
+  int peak_to_peak = signal_max - signal_min;
+  
+  // Сохранение значений
+  mic_value = analogRead(MIC_PIN);  // текущее значение
+  mic_max = max(mic_max, signal_max);
+  mic_min = min(mic_min, signal_min);
+  
+  // Конвертация в "громкость" (0.0 - 1.0)
+  mic_volume = (float)peak_to_peak / 4095.0;
+  
+  // Детектор звука
+  static bool sound_detected = false;
+  if (peak_to_peak > 100) {  // Порог
+    if (!sound_detected) {
+      Serial.println("🔊 ЗВУК ОБНАРУЖЕН!");
+      sound_detected = true;
+    }
+  } else {
+    sound_detected = false;
+  }
+}
+
+// ================= ВЕБ-ИНТЕРФЕЙС =================
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HW-484 Analog Mic Test</title>
+<style>
+body {font-family: Arial; background: #0f172a; color: white; padding: 20px;}
+.container {max-width: 800px; margin: 0 auto;}
+h1 {color: #38bdf8;}
+.vu-meter {
+  width: 100%; height: 40px; background: #1e293b; border-radius: 10px;
+  margin: 20px 0; overflow: hidden; position: relative;
+}
+.vu-level {
+  height: 100%; background: linear-gradient(90deg, #10b981, #f59e0b, #ef4444);
+  width: 0%; transition: width 0.2s;
+}
+.controls {margin: 20px 0;}
+.btn {
+  padding: 12px 24px; border: none; border-radius: 8px;
+  cursor: pointer; font-weight: bold; margin: 5px;
+}
+.btn-on {background: #10b981;}
+.btn-off {background: #ef4444;}
+.stats {display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;}
+.stat {
+  background: #1e293b; padding: 20px; border-radius: 10px;
+  text-align: center;
+}
+.stat-value {font-size: 2rem; font-weight: bold; color: #38bdf8;}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🎤 HW-484 АНАЛОГОВЫЙ МИКРОФОН</h1>
+<p>Подключение: OUT → GPIO14, VCC → 3.3V, GND → GND</p>
+
+<div class="vu-meter">
+<div class="vu-level" id="vu-level"></div>
+</div>
+
+<div class="stats">
+<div class="stat">
+<div>ТЕКУЩЕЕ</div>
+<div class="stat-value" id="current-value">0</div>
+</div>
+<div class="stat">
+<div>ГРОМКОСТЬ</div>
+<div class="stat-value" id="volume">0%</div>
+</div>
+<div class="stat">
+<div>МАКСИМУМ</div>
+<div class="stat-value" id="max-value">0</div>
+</div>
+<div class="stat">
+<div>МИНИМУМ</div>
+<div class="stat-value" id="min-value">4095</div>
+</div>
+</div>
+
+<div class="controls">
+<button class="btn btn-on" onclick="toggleMic(true)">▶️ ВКЛ</button>
+<button class="btn btn-off" onclick="toggleMic(false)">⏹️ ВЫКЛ</button>
+<button class="btn" onclick="calibrate()" style="background:#8b5cf6;">🎚️ КАЛИБРОВКА</button>
+</div>
+
+<div id="status" style="margin-top:20px;padding:10px;background:#334155;border-radius:5px;">
+Статус: <span id="status-text">Активен</span>
+</div>
+</div>
+
+<script>
+function updateData() {
+fetch('/data')
+.then(r => r.json())
+.then(data => {
+// VU-meter
+document.getElementById('vu-level').style.width = (data.volume * 100) + '%';
+// Значения
+document.getElementById('current-value').textContent = data.current;
+document.getElementById('volume').textContent = Math.round(data.volume * 100) + '%';
+document.getElementById('max-value').textContent = data.max;
+document.getElementById('min-value').textContent = data.min;
+document.getElementById('status-text').textContent = 
+data.enabled ? 'АКТИВЕН 🔊' : 'ВЫКЛЮЧЕН 🔇';
+});
+setTimeout(updateData, 100);
+}
+
+function toggleMic(enabled) {
+fetch('/mic?enabled=' + (enabled ? '1' : '0'), {method:'POST'});
+}
+
+function calibrate() {
+fetch('/calibrate', {method:'POST'})
+.then(() => alert('Калибровка! Не издавайте звуков 3 секунды.'));
+}
+
+// Автообновление
+setInterval(updateData, 300);
+updateData();
+</script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"current\":" + String(mic_value) + ",";
+  json += "\"max\":" + String(mic_max) + ",";
+  json += "\"min\":" + String(mic_min) + ",";
+  json += "\"volume\":" + String(mic_volume, 3) + ",";
+  json += "\"enabled\":" + String(mic_enabled ? "true" : "false");
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleMicControl() {
+  if (server.hasArg("enabled")) {
+    mic_enabled = (server.arg("enabled") == "1");
+    server.send(200, "text/plain", mic_enabled ? "ON" : "OFF");
+  }
+}
+
+void handleCalibrate() {
+  // Калибровка - измерение фонового шума
+  mic_max = 0;
+  mic_min = 4095;
+  server.send(200, "text/plain", "Calibrated");
+}
+
+// ================= ОСНОВНОЙ КОД =================
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  
+  Serial.println("\n=== HW-484 АНАЛОГОВЫЙ МИКРОФОН ===");
+  Serial.println("Пин OUT → GPIO14 (ADC1_CH6)");
+  Serial.println("Пин VCC → 3.3V");
+  Serial.println("Пин GND → GND");
+  Serial.println("Пин AO  → Не используется");
+  
+  // Инициализация АЦП
+  init_adc_mic();
+  
+  // WiFi точка доступа
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  Serial.print("📶 WiFi: ");
+  Serial.println(ssid);
+  Serial.print("🌐 IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Веб-сервер
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/mic", HTTP_POST, handleMicControl);
+  server.on("/calibrate", HTTP_POST, handleCalibrate);
+  server.begin();
+  
+  Serial.println("✅ Сервер запущен");
+  Serial.println("Откройте: http://" + WiFi.softAPIP().toString());
+}
+
+void loop() {
+  server.handleClient();
+  read_analog_mic();
+  
+  // Периодический вывод в Serial
+  static unsigned long last_print = 0;
+  if (millis() - last_print > 1000) {
+    last_print = millis();
+    Serial.printf("Значение: %4d | Громкость: %.3f\n", mic_value, mic_volume);
+  }
+  
+  delay(10);
+}

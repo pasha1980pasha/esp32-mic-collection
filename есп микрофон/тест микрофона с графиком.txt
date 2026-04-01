@@ -1,0 +1,194 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+
+const char* ssid = "ESP32-TEST";
+const char* password = "12345678";
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+#define MIC_PIN 14
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      }
+      break;
+    case WStype_TEXT:
+      Serial.printf("[%u] Text: %s\n", num, payload);
+      break;
+  }
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ТЕСТ МИКРОФОНА</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { background: black; color: white; text-align: center; padding: 20px; font-family: Arial; }
+        .value { font-size: 100px; color: lime; }
+        .bar { 
+            width: 100%; 
+            height: 50px; 
+            background: #333;
+            border-radius: 25px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        .fill {
+            height: 100%;
+            background: linear-gradient(90deg, green, yellow, red);
+            width: 0%;
+            transition: width 0.05s;
+        }
+        canvas {
+            width: 100%;
+            height: 200px;
+            background: #111;
+            border: 1px solid #333;
+            margin-top: 20px;
+        }
+        #status { font-size: 24px; margin: 20px; }
+    </style>
+</head>
+<body>
+    <h1>🎤 ТЕСТ МИКРОФОНА</h1>
+    <div class="bar">
+        <div class="fill" id="bar"></div>
+    </div>
+    <div class="value" id="value">0</div>
+    <div id="status">⚪ Тишина</div>
+    <canvas id="oscilloscope" width="800" height="200"></canvas>
+    <div id="connection" style="color: yellow; margin: 10px;">Подключение...</div>
+    
+    <script>
+        let ws;
+        let values = [];
+        let canvas = document.getElementById('oscilloscope');
+        let ctx = canvas.getContext('2d');
+        let reconnectAttempts = 0;
+        
+        function connect() {
+            ws = new WebSocket('ws://' + location.hostname + ':81');
+            
+            ws.onopen = function() {
+                document.getElementById('connection').innerHTML = '✅ Подключено';
+                document.getElementById('connection').style.color = 'lime';
+                reconnectAttempts = 0;
+            };
+            
+            ws.onclose = function() {
+                document.getElementById('connection').innerHTML = '❌ Отключено. Переподключение...';
+                document.getElementById('connection').style.color = 'red';
+                setTimeout(connect, 2000);
+            };
+            
+            ws.onmessage = function(event) {
+                let val = parseInt(event.data);
+                let percent = (val / 4095 * 100);
+                
+                document.getElementById('value').innerHTML = val;
+                document.getElementById('bar').style.width = percent + '%';
+                
+                if(val > 3500) document.getElementById('status').innerHTML = '🔴 ОЧЕНЬ ГРОМКО!';
+                else if(val > 2500) document.getElementById('status').innerHTML = '🟡 ГРОМКО';
+                else if(val > 1500) document.getElementById('status').innerHTML = '🟢 НОРМАЛЬНО';
+                else document.getElementById('status').innerHTML = '⚪ ТИШИНА';
+                
+                // Для осциллографа
+                values.push(val);
+                if(values.length > 200) values.shift();
+                drawOscilloscope();
+            };
+        }
+        
+        function drawOscilloscope() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = '#0f0';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            
+            let width = canvas.width;
+            let height = canvas.height;
+            
+            for(let i = 0; i < values.length - 1; i++) {
+                let x1 = (i / 200) * width;
+                let y1 = height - (values[i] / 4095) * height;
+                let x2 = ((i + 1) / 200) * width;
+                let y2 = height - (values[i + 1] / 4095) * height;
+                
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+            }
+            ctx.stroke();
+        }
+        
+        // Запускаем подключение
+        connect();
+        
+        // Изменяем размер canvas при загрузке
+        window.onload = function() {
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  Serial.print("IP адрес: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("Подключитесь к WiFi: ESP32-TEST");
+  Serial.println("Откройте браузер и перейдите по IP адресу");
+  
+  server.on("/", handleRoot);
+  server.begin();
+  
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  
+  // Отправляем данные через WebSocket
+  static unsigned long lastSend = 0;
+  if(millis() - lastSend > 20) { // 50 раз в секунду
+    lastSend = millis();
+    int val = analogRead(MIC_PIN);
+    
+    // Создаем String объект и передаем его
+    String payload = String(val);
+    webSocket.broadcastTXT(payload);
+    
+    // Вывод в Serial для отладки
+    static unsigned long t = 0;
+    if(millis() - t > 500) {
+      t = millis();
+      Serial.print("Значение микрофона: ");
+      Serial.println(val);
+    }
+  }
+}

@@ -1,0 +1,204 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+
+const char* ssid = "ESP32-TEST";
+const char* password = "12345678";
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+#define MIC_PIN 14
+
+const int SAMPLE_RATE = 8000;
+const int SAMPLES_PER_PACKET = 256;
+const int PREAMP = 3;
+
+int16_t audioBuffer[SAMPLES_PER_PACKET];
+int bufferIndex = 0;
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL = 1000000 / SAMPLE_RATE;
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ТЕСТ МИКРОФОНА</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { background: black; color: white; text-align: center; padding: 20px; font-family: Arial; }
+        button { 
+            padding: 20px 40px; 
+            font-size: 24px;
+            background: #4CAF50;
+            border: none;
+            border-radius: 10px;
+            color: white;
+            cursor: pointer;
+            margin: 10px;
+        }
+        .stop { background: #f44336; }
+        .status { 
+            font-size: 20px; 
+            margin: 20px;
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 10px;
+        }
+        .good { color: #0f0; }
+    </style>
+</head>
+<body>
+    <h1>🎤 ТЕСТ МИКРОФОНА</h1>
+    
+    <div class="status" id="status1">⚪ WiFi: Подключение...</div>
+    <div class="status" id="status2">⚪ WebSocket: Ожидание...</div>
+    <div class="status" id="status3">⚪ Аудио: Не активно</div>
+    
+    <button id="startBtn" onclick="startAudio()">🔴 ВКЛЮЧИТЬ МИКРОФОН</button>
+    <button id="stopBtn" class="stop" onclick="stopAudio()" disabled>⏹ ВЫКЛЮЧИТЬ</button>
+    
+    <script>
+        let ws;
+        let audioContext;
+        let audioEnabled = false;
+        
+        function connect() {
+            ws = new WebSocket('ws://' + location.hostname + ':81');
+            ws.binaryType = 'arraybuffer';
+            
+            ws.onopen = function() {
+                document.getElementById('status2').innerHTML = '<span class="good">✅</span> WebSocket: Подключено';
+            };
+            
+            ws.onclose = function() {
+                document.getElementById('status2').innerHTML = '❌ WebSocket: Отключено';
+                setTimeout(connect, 2000);
+            };
+            
+            ws.onmessage = function(event) {
+                if (!audioEnabled) return;
+                
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                const int16Data = new Int16Array(event.data);
+                const floatData = new Float32Array(int16Data.length);
+                
+                for(let i = 0; i < int16Data.length; i++) {
+                    floatData[i] = int16Data[i] / 2048.0;
+                }
+                
+                const audioBuffer = audioContext.createBuffer(1, floatData.length, 8000);
+                audioBuffer.copyToChannel(floatData, 0);
+                
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+                
+                document.getElementById('status3').innerHTML = '<span class="good">🔊</span> Аудио: Активно';
+            };
+        }
+        
+        function startAudio() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                connect();
+                setTimeout(startAudio, 1000);
+                return;
+            }
+            
+            audioEnabled = true;
+            ws.send('START');
+            
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+        }
+        
+        function stopAudio() {
+            audioEnabled = false;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('STOP');
+            }
+            
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('status3').innerHTML = '⚪ Аудио: Остановлено';
+        }
+        
+        window.onload = function() {
+            document.getElementById('status1').innerHTML = '<span class="good">✅</span> WiFi: Подключено к ESP32';
+            connect();
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if(type == WStype_TEXT) {
+    String cmd = String((char*)payload);
+    if(cmd == "START") {
+      Serial.println("Аудио стрим START");
+    } else if(cmd == "STOP") {
+      Serial.println("Аудио стрим STOP");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  Serial.println("=== АУДИО МОНИТОР ===");
+  Serial.print("IP адрес: ");
+  Serial.println(WiFi.softAPIP());
+  
+  server.on("/", handleRoot);
+  server.begin();
+  
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+bool streaming = true;
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  
+  unsigned long now = micros();
+  if(now - lastSampleTime >= SAMPLE_INTERVAL) {
+    lastSampleTime = now;
+    
+    int16_t sample = analogRead(MIC_PIN) - 2048;
+    sample = sample * PREAMP;
+    
+    if(sample > 2047) sample = 2047;
+    if(sample < -2048) sample = -2048;
+    
+    audioBuffer[bufferIndex] = sample;
+    bufferIndex++;
+    
+    if(bufferIndex >= SAMPLES_PER_PACKET) {
+      bufferIndex = 0;
+      
+      if(webSocket.connectedClients() > 0 && streaming) {
+        webSocket.broadcastBIN((uint8_t*)audioBuffer, sizeof(audioBuffer));
+      }
+    }
+  }
+}
